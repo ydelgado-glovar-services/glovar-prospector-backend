@@ -185,7 +185,7 @@ jobs: dict[str, Any] = {}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://glovar-prospector-front-ten.vercel.app",
+        "https://glovar-prospector-frontend.vercel.app",
         "http://localhost:3000",
     ],
     allow_credentials=True,
@@ -302,10 +302,12 @@ def buscar_noticias_empresa(
 
     # Orquestación de Query Dinámica
     if triggers_compra and triggers_compra.strip():
-        query = f"{nombre_empresa} AND ({triggers_compra.strip()})"
+        # [Sec-Driven] Use exact match quotes around company name to prevent hallucinated news attribution
+        query = f'"{nombre_empresa}" AND ({triggers_compra.strip()})'
     else:
         ubicacion = pais.strip() if pais and pais.strip() else "Colombia"
-        query = f"{nombre_empresa} (news OR expansion OR updates OR {ubicacion})"
+        # [Sec-Driven] Exact match enforcement
+        query = f'"{nombre_empresa}" (news OR expansion OR updates OR {ubicacion})'
 
     # ── Guardrail: truncar query a 400 chars (límite seguro de Tavily) ──
     query = query[:400]
@@ -813,9 +815,49 @@ async def _process_single_lead(
             nombre_perfil = perfil_dict.get("nombre", "Desconocido")
 
             print(f"[Orquestador] ▶ Iniciando procesamiento de '{nombre_perfil}' (semáforo adquirido)...")
+            empresa_nombre, cargo_actual = _extraer_empresa_actual(perfil_dict)
+
+            # ── [Sec-Driven] Early Exit: O(n) Exclusion List Guard Clause ──
+            # Si la empresa está en la blacklist del usuario, abortamos antes de gastar cuotas de Tavily/Groq.
+            if params.exclusion_list and empresa_nombre:
+                emp_lower = empresa_nombre.lower()
+                if any(k.lower() in emp_lower for k in params.exclusion_list):
+                    print(f"[Orquestador] 🛑 Early Exit: '{empresa_nombre}' está en la lista de exclusión.")
+                    lead_completo = {
+                        "nombre_lead": nombre_perfil,
+                        "empresa": empresa_nombre,
+                        "cargo": cargo_actual,
+                        "linkedin_url": perfil_dict.get("linkedin_url", ""),
+                        "es_calificado": False,
+                        "razonamiento_filtro": "Excluded by Custom Blacklist",
+                        "trigger_noticia": "",
+                        "mensaje_generado": "",
+                        "email": None,
+                        "telefono": None,
+                        "url_noticia": None,
+                    }
+                    guardado_ok = False
+                    lead_id = None
+                    try:
+                        # Convert to LeadEvaluado dict for save_to_supabase
+                        eval_mock = LeadEvaluado(
+                            es_calificado=False,
+                            razonamiento_filtro="Excluded by Custom Blacklist",
+                            trigger_noticia="",
+                            mensaje_generado=""
+                        )
+                        supabase_res = await asyncio.to_thread(save_to_supabase, eval_mock, perfil_dict, user_id)
+                        if supabase_res and "id" in supabase_res:
+                            lead_id = str(supabase_res["id"])
+                            guardado_ok = True
+                    except Exception as e:
+                        print(f"[Orquestador] Advertencia: no se pudo guardar el lead excluido '{nombre_perfil}': {e}")
+                    
+                    lead_completo["id"] = lead_id
+                    lead_completo["guardado_en_db"] = guardado_ok
+                    return lead_completo
 
             # ── Paso 1: Buscar noticias recientes de la empresa vía Tavily ──
-            empresa_nombre, _ = _extraer_empresa_actual(perfil_dict)
             noticias_extraidas, url_noticia = await asyncio.to_thread(
                 buscar_noticias_empresa, empresa_nombre, params.triggers_compra, params.pais
             )

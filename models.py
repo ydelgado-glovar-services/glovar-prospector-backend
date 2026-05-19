@@ -72,6 +72,10 @@ class SearchParams(BaseModel):
         default=30,
         description="Límite máximo de perfiles a obtener en la prospección",
     )
+    exclusion_list: list[str] = Field(
+        default=[],
+        description="[Sec-Driven] Lista O(n) de empresas a excluir (Early Exit guard clause).",
+    )
 
 
 # ──────────────────────────────────────────────
